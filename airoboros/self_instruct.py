@@ -237,6 +237,9 @@ class SelfInstructor:
         self, instruction: str, filter_response: bool = True, **kwargs
     ):
         text = await self.completion_source.generate_response(instruction, **kwargs)
+        if not text:
+            return None
+        
         if filter_response:
             for banned in self.response_filters:
                 if banned.search(text, re.I):
