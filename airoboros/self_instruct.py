@@ -1,8 +1,5 @@
-import aiohttp
 import argparse
 import asyncio
-import backoff
-import copy
 import datetime
 import faiss
 import os
@@ -11,33 +8,21 @@ import math
 import numpy as np
 import random
 import re
-import requests
 import secrets
 import sys
 import yaml
 from collections import defaultdict
 from loguru import logger
-from time import sleep
 from tqdm import tqdm
 from typing import List, Dict, Any
-from uuid import uuid4
 from airoboros.embeddings import calculate_embeddings
-from airoboros.exceptions import (
-    RateLimitError,
-    TooManyRequestsError,
-    TokensExhaustedError,
-    ServerOverloadedError,
-    ServerError,
-    ContextLengthExceededError,
-    BadResponseError,
-)
+from airoboros import completionsource
 from fast_sentence_transformers import FastSentenceTransformer
 from sentence_transformers import SentenceTransformer
 from transformers import AutoTokenizer
 
 # Defaults and constants.
 MAX_DOCSTORE_SIZE = 15000
-OPENAI_API_BASE_URL = "https://api.openai.com"
 READABILITY_HINT = "The output should be written in such a way as to have a Flesch-Kincaid readability score of 30 or lower - best understood by those with college education.  Only output the story - don't add any notes or information about Flesch-Kincaid scores."
 
 
@@ -63,7 +48,6 @@ class SelfInstructor:
         if not debug:
             logger.remove()
             logger.add(sys.stdout, level="INFO")
-        self.used_tokens = 0
         self.config_path = config_path
         self.load_config()
         self.instructor_counts = defaultdict(int)
@@ -71,15 +55,7 @@ class SelfInstructor:
     def load_config(self):
         """Load an advanced configuration from a YAML file."""
         raw_config = self.raw_config = yaml.safe_load(open(self.config_path).read())
-        self.model = raw_config.get("model") or "gpt-4"
-        self.openai_api_key = raw_config.get("openai_api_key") or os.environ.get(
-            "OPENAI_API_KEY"
-        )
-        if not self.openai_api_key:
-            raise ValueError(
-                "OPENAI_API_KEY environment variable or openai_api_key must be provided"
-            )
-        self.organization_id = raw_config.get("organization_id")
+        self.completion_source = completionsource.get(raw_config)
         self.topics_path = raw_config.get("topics_path") or "topics.txt"
         self.output_path = raw_config.get("output_path") or "instructions.jsonl"
         self.overwrite = str(raw_config.get("overwrite")).lower() == "true"
@@ -88,9 +64,6 @@ class SelfInstructor:
         self.response_filters = []
         for val in raw_config.get("response_filters") or []:
             self.response_filters.append(re.compile(val, re.I))
-        self.max_tokens = (
-            int(raw_config["max_tokens"]) if raw_config.get("max_tokens") else None
-        )
         self.min_docsearch_score = float(raw_config.get("min_docsearch_score") or 0.35)
         api_params = raw_config.get("api_params") or {}
         self.api_params = {
@@ -129,11 +102,11 @@ class SelfInstructor:
 
         # Validate the model for each generator.
         self.instructors = raw_config.get("instructors")
-        self.validate_model(self.model)
-        valid_models = {self.model: True}
+        self.completion_source.validate_model()
+        valid_models = {}
         for key, config in self.instructors.items():
             if config.get("model") and config["model"] not in valid_models:
-                self.validate_model(config["model"])
+                self.completion_source.validate_model(config["model"])
                 valid_models[config["model"]] = True
 
     def initialize_index(self):
@@ -179,21 +152,6 @@ class SelfInstructor:
                     ]
                 )
             )
-
-    def validate_model(self, model):
-        """Ensure the specified model is available."""
-        headers = {"Authorization": f"Bearer {self.openai_api_key}"}
-        if self.organization_id:
-            headers["OpenAI-Organization"] = self.organization_id
-        result = requests.get(f"{OPENAI_API_BASE_URL}/v1/models", headers=headers)
-        if result.status_code != 200:
-            raise ValueError(
-                f"Invalid openai API key [{result.status_code}: {result.text}]"
-            )
-        available = {item["id"] for item in result.json()["data"]}
-        if model not in available:
-            raise ValueError(f"Model is not available to your API key: {model}")
-        logger.success(f"Successfully validated model: {model}")
 
     async def initialize_topics(self) -> List[str]:
         """Ensure topics are initialized, i.e. topics already exist and are read,
@@ -275,109 +233,10 @@ class SelfInstructor:
         with open(path) as infile:
             return infile.read()
 
-    @backoff.on_exception(
-        backoff.fibo,
-        (
-            requests.exceptions.ConnectionError,
-            requests.exceptions.Timeout,
-            ServerError,
-            RateLimitError,
-            TooManyRequestsError,
-            ServerOverloadedError,
-        ),
-        max_value=19,
-    )
-    async def _post(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """Perform a post request to OpenAI API.
-
-        :param path: URL path to send request to.
-        :type path: str
-
-        :param payload: Dict containing request body/payload.
-        :type payload: Dict[str, Any]
-
-        :return: Response object.
-        :rtype: Dict[str, Any]
-        """
-        headers = {"Authorization": f"Bearer {self.openai_api_key}"}
-        if self.organization_id:
-            headers["OpenAI-Organization"] = self.organization_id
-        request_id = str(uuid4())
-        logger.debug(f"POST [{request_id}] with payload {json.dumps(payload)}")
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"{OPENAI_API_BASE_URL}{path}",
-                headers=headers,
-                json=payload,
-                timeout=600.0,
-            ) as result:
-                if result.status != 200:
-                    text = await result.text()
-                    logger.error(f"OpenAI request error: {text}")
-                    if "too many requests" in text.lower():
-                        raise TooManyRequestsError(text)
-                    if (
-                        "rate limit reached" in text.lower()
-                        or "rate_limit_exceeded" in text.lower()
-                    ):
-                        sleep(30)
-                        raise RateLimitError(text)
-                    elif "context_length_exceeded" in text.lower():
-                        raise ContextLengthExceededError(text)
-                    elif "server_error" in text and "overloaded" in text.lower():
-                        raise ServerOverloadedError(text)
-                    elif (
-                        "bad gateway" in text.lower() or "server_error" in text.lower()
-                    ):
-                        raise ServerError(text)
-                    else:
-                        raise BadResponseError(text)
-                result = await result.json()
-                logger.debug(f"POST [{request_id}] response: {json.dumps(result)}")
-                self.used_tokens += result["usage"]["total_tokens"]
-                if self.max_tokens and self.used_tokens > self.max_tokens:
-                    raise TokensExhaustedError(
-                        f"Max token usage exceeded: {self.used_tokens}"
-                    )
-                logger.debug(f"token usage: {self.used_tokens}")
-                return result
-
-    async def _post_no_exc(self, *a, **k):
-        """Post, ignoring all exceptions."""
-        try:
-            return await self._post(*a, **k)
-        except Exception as ex:
-            logger.error(f"Error performing post: {ex}")
-        return None
-
-    async def generate_response(self, instruction: str, **kwargs) -> str:
-        """Call OpenAI with the specified instruction and return the text response.
-
-        :param instruction: The instruction to respond to.
-        :type instruction: str
-
-        :return: Response text.
-        :rtype: str
-        """
-        messages = copy.deepcopy(kwargs.pop("messages", None) or [])
-        filter_response = kwargs.pop("filter_response", True)
-        model = kwargs.get("model", self.model)
-        path = "/v1/chat/completions"
-        payload = {**kwargs}
-        if "model" not in payload:
-            payload["model"] = model
-        payload["messages"] = messages
-        if instruction:
-            payload["messages"].append({"role": "user", "content": instruction})
-        response = await self._post_no_exc(path, payload)
-        if (
-            not response
-            or not response.get("choices")
-            or response["choices"][0]["finish_reason"] == "length"
-        ):
-            return None
-        text = response["choices"][0]["message"]["content"]
-
+    async def generate_response(
+        self, instruction: str, filter_response: bool = True, **kwargs
+    ):
+        text = await self.completion_source.generate_response(instruction, **kwargs)
         if filter_response:
             for banned in self.response_filters:
                 if banned.search(text, re.I):
@@ -779,6 +638,11 @@ class SelfInstructor:
         from airoboros.instructors.trivia import generate as trivia_generator
         from airoboros.instructors.wordgame import generate as wordgame_generator
         from airoboros.instructors.writing import generate as writing_generator
+        from airoboros.instructors.character import generate as character_generator
+        from airoboros.instructors.stylized_response import (
+            generate as stylized_response_generator,
+        )
+        from airoboros.instructors.gtkm import generate as gtkm_generator
 
         method_map = {
             "agent": agent_generator,
@@ -787,9 +651,11 @@ class SelfInstructor:
             "contextual": contextual_generator,
             "cot": cot_generator,
             "counterfactual_contextual": counterfactual_contextual_generator,
+            "character": character_generator,
             "detailed_writing": detailed_writing_generator,
             "experience": experience_generator,
             "general": general_generator,
+            "gtkm": gtkm_generator,
             "joke": joke_generator,
             "multiple_choice": multiple_choice_generator,
             "plan": plan_generator,
@@ -798,6 +664,7 @@ class SelfInstructor:
             "roleplay": roleplay_generator,
             "rp": rp_generator,
             "song": song_generator,
+            "stylized_response": stylized_response_generator,
             "trivia": trivia_generator,
             "wordgame": wordgame_generator,
             "writing": writing_generator,
